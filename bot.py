@@ -26,8 +26,8 @@ from aiogram.types import BufferedInputFile
 # ============================================================
 # КОНФИГУРАЦИЯ
 # ============================================================
-BOT_TOKEN          = "ВСТАВЬ_НОВЫЙ_ТОКЕН"           # @BotFather → /revoke → новый токен
-COINGLASS_API_KEY  = "ВСТАВЬ_НОВЫЙ_COINGLASS_КЛЮЧ"  # coinglass.com → API Keys → новый ключ
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+COINGLASS_API_KEY = os.environ["COINGLASS_API_KEY"]
 
 ALERT_CHAT_ID      = -1003867089540   # ID твоей группы
 ALERT_TOPIC_ID     = 17135            # ID топика в группе
