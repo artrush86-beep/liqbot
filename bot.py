@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import statistics
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -116,6 +117,13 @@ _multi_oi_cache = {}  # {symbol: {"binance": oi, "bybit": oi, "okx": oi, "bitget
 
 OKX_BASE_URL = "https://www.okx.com"
 BITGET_BASE_URL = "https://api.bitget.com"
+COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+
+# Multi-exchange Funding Rate cache: {symbol: {"binance": rate, "bybit": rate, "okx": rate, "bitget": rate, "aggregated": rate, "sources": count}}
+_multi_funding_cache = {}
+
+# Historical liquidations cache
+_hist_liq_cache = {}  # {symbol: [{time, long_liq, short_liq}, ...]}
 
 
 async def liquidation_ws_listener():
@@ -255,6 +263,231 @@ def get_multi_exchange_oi(sym: str, price: float) -> float:
     
     # Fallback
     return price * 1_000_000
+
+
+def get_binance_funding(sym: str) -> float:
+    """Get funding rate from Binance (1h, 8h, or current)"""
+    try:
+        # Try premiumIndex for current funding rate
+        data = exchange_get("Binance", BINANCE_BASE_URL, "/fapi/v1/premiumIndex", {"symbol": sym})
+        if data and "lastFundingRate" in data:
+            return float(data["lastFundingRate"]) * 100  # Convert to percentage
+    except Exception as e:
+        logger.debug(f"Binance funding error for {sym}: {e}")
+    return None
+
+
+def get_bybit_funding(sym: str) -> float:
+    """Get funding rate from Bybit"""
+    try:
+        d = exchange_get("Bybit", BYBIT_BASE_URL, "/v5/market/tickers",
+                        {"category": "linear", "symbol": sym})
+        if d and d.get("result") and d["result"].get("list"):
+            funding = d["result"]["list"][0].get("fundingRate")
+            if funding:
+                return float(funding) * 100
+    except Exception as e:
+        logger.debug(f"Bybit funding error for {sym}: {e}")
+    return None
+
+
+def get_okx_funding(sym: str) -> float:
+    """Get funding rate from OKX"""
+    try:
+        okx_sym = f"{sym.replace('USDT', '')}-USDT-SWAP"
+        url = f"{OKX_BASE_URL}/api/v5/public/funding-rate"
+        params = {"instId": okx_sym}
+        r = http.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data") and len(data["data"]) > 0:
+                return float(data["data"][0].get("fundingRate", 0)) * 100
+    except Exception as e:
+        logger.debug(f"OKX funding error for {sym}: {e}")
+    return None
+
+
+def get_bitget_funding(sym: str) -> float:
+    """Get funding rate from Bitget"""
+    try:
+        bg_sym = f"{sym}_UMCBL"
+        url = f"{BITGET_BASE_URL}/api/v2/mix/market/funding-rate"
+        params = {"symbol": bg_sym, "productType": "USDT-FUTURES"}
+        r = http.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data") and data.get("code") == "00000":
+                return float(data["data"].get("fundingRate", 0)) * 100
+    except Exception as e:
+        logger.debug(f"Bitget funding error for {sym}: {e}")
+    return None
+
+
+def aggregate_with_outlier_detection(values: list, threshold: float = 2.0) -> tuple:
+    """
+    Aggregate multiple values with outlier detection using standard deviation.
+    Returns: (aggregated_value, num_sources, method_used)
+    """
+    if not values:
+        return None, 0, "no_data"
+    
+    if len(values) == 1:
+        return values[0], 1, "single"
+    
+    # Remove exact duplicates
+    unique_values = list(set(values))
+    if len(unique_values) == 1:
+        return unique_values[0], len(values), "identical"
+    
+    # Calculate mean and std
+    mean = statistics.mean(unique_values)
+    if len(unique_values) >= 3:
+        try:
+            std = statistics.stdev(unique_values)
+            # Filter outliers (values beyond threshold * std from mean)
+            filtered = [v for v in unique_values if abs(v - mean) <= threshold * std]
+            if filtered:
+                # Use median for robustness
+                median_val = statistics.median(filtered)
+                return median_val, len(filtered), "median_filtered"
+        except:
+            pass
+    
+    # Fallback to median of all values
+    median_val = statistics.median(unique_values)
+    return median_val, len(unique_values), "median"
+
+
+def get_multi_exchange_funding(sym: str) -> dict:
+    """Get aggregated funding rate from all available exchanges with outlier detection"""
+    global _multi_funding_cache
+    
+    # Get funding from each exchange
+    sources = {}
+    
+    binance_funding = get_binance_funding(sym)
+    if binance_funding is not None:
+        sources["binance"] = binance_funding
+    
+    bybit_funding = get_bybit_funding(sym)
+    if bybit_funding is not None:
+        sources["bybit"] = bybit_funding
+    
+    okx_funding = get_okx_funding(sym)
+    if okx_funding is not None:
+        sources["okx"] = okx_funding
+    
+    bitget_funding = get_bitget_funding(sym)
+    if bitget_funding is not None:
+        sources["bitget"] = bitget_funding
+    
+    # Aggregate with outlier detection
+    all_values = list(sources.values())
+    aggregated, num_sources, method = aggregate_with_outlier_detection(all_values)
+    
+    # Store in cache
+    _multi_funding_cache[sym] = {
+        **sources,
+        "aggregated": aggregated,
+        "sources": num_sources,
+        "method": method,
+        "timestamp": time.time()
+    }
+    
+    if aggregated is not None:
+        logger.info(f"Multi-exchange funding for {sym}: {aggregated:.4f}% from {num_sources} sources ({method})")
+    
+    return _multi_funding_cache[sym]
+
+
+def get_coinglass_liquidations(sym: str, hours: int = 24) -> dict:
+    """Get historical liquidations from Coinglass (if API key available)"""
+    api_key = os.getenv("COINGLASS_API_KEY")
+    if not api_key:
+        return None
+    
+    try:
+        # Coinglass API v3
+        url = f"https://open-api.coinglass.com/public/v2/liquidation_history"
+        headers = {"coinglassSecret": api_key}
+        params = {
+            "symbol": sym,
+            "time_type": "hourly",
+            "range": hours
+        }
+        r = http.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data"):
+                return {
+                    "long_liq": sum(float(d.get("longLiquidationUsd", 0)) for d in data["data"]),
+                    "short_liq": sum(float(d.get("shortLiquidationUsd", 0)) for d in data["data"]),
+                    "entries": len(data["data"])
+                }
+    except Exception as e:
+        logger.debug(f"Coinglass liquidation error for {sym}: {e}")
+    return None
+
+
+def get_okx_liquidation_history(sym: str, hours: int = 24) -> dict:
+    """Get liquidation history from OKX"""
+    try:
+        okx_sym = f"{sym.replace('USDT', '')}-USDT-SWAP"
+        url = f"{OKX_BASE_URL}/api/v5/public/liquidation-orders"
+        # OKX gives data in pages, get last 100 records
+        params = {
+            "instType": "SWAP",
+            "instId": okx_sym,
+            "mgnMode": "",
+            "type": "",
+            "state": "filled",
+            "limit": "100"
+        }
+        r = http.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data"):
+                cutoff_time = (int(time.time()) - hours * 3600) * 1000  # OKX uses ms
+                long_liq = 0
+                short_liq = 0
+                count = 0
+                for entry in data["data"]:
+                    if int(entry.get("fillTime", 0)) >= cutoff_time:
+                        size = float(entry.get("sz", 0))
+                        price = float(entry.get("fillPx", 0))
+                        side = entry.get("side", "")
+                        if side == "sell":  # long liquidation
+                            long_liq += size * price
+                        else:  # short liquidation
+                            short_liq += size * price
+                        count += 1
+                return {"long_liq": long_liq, "short_liq": short_liq, "entries": count}
+    except Exception as e:
+        logger.debug(f"OKX liquidation history error for {sym}: {e}")
+    return None
+
+
+def get_btc_dominance() -> dict:
+    """Get BTC dominance from CoinGecko (free tier)"""
+    try:
+        url = f"{COINGECKO_BASE_URL}/global"
+        r = http.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data"):
+                market_cap = data["data"].get("total_market_cap", {})
+                btc_cap = market_cap.get("btc", 0)
+                total_cap = sum(market_cap.values()) if market_cap else 0
+                if total_cap > 0:
+                    dominance = (btc_cap / total_cap) * 100
+                    return {
+                        "btc_dominance": dominance,
+                        "total_market_cap_usd": data["data"].get("total_market_cap", {}).get("usd", 0),
+                        "market_cap_change_24h": data["data"].get("market_cap_change_percentage_24h_usd", 0)
+                    }
+    except Exception as e:
+        logger.debug(f"CoinGecko dominance error: {e}")
+    return None
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -554,9 +787,9 @@ def build_chart(df: pd.DataFrame, symbol: str, current_price: float) -> io.Bytes
     bh = (pr / max(nl, 1)) * 0.75
     dec = _dec(df["price"].max())
 
-    max_render_height = 60
-    fig_h = min(max(8, nl * 0.18), max_render_height)
-    dpi = max(90, min(150, int(9000 / max(12, fig_h))))
+    max_render_height = 35
+    fig_h = min(max(6, nl * 0.12), max_render_height)
+    dpi = max(80, min(120, int(6000 / max(12, fig_h))))
 
     fig, ax = plt.subplots(figsize=(12, fig_h))
     fig.patch.set_facecolor("#131722")
@@ -718,22 +951,30 @@ async def _send_chart_media(
 async def cmd_help(message: types.Message):
     coins = " ".join([f"<code>{s}</code>" for s in WATCHLIST])
     await message.answer(
-        "📊 <b>Liquidation Map Bot v2</b>\n\n"
+        "📊 <b>Liquidation Map Bot v3</b>\n"
+        "<i>Multi-Exchange • Aggregation • Fallback</i>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 <b>Команды:</b>\n"
+        "📌 <b>Основные:</b>\n"
         "  <code>/liq BTC</code> — карта ликвидаций\n"
-        "  <code>/scan</code> — топ магниты по всем монетам\n"
-        "  <code>/top</code> — самые жирные зоны прямо сейчас\n"
-        "  <code>/liqstats</code> — реальные ликвидации (WS)\n"
-        "  <code>/net</code> — диагностика сети\n\n"
+        "  <code>/scan</code> — скан всех монет\n"
+        "  <code>/top</code> — топ-5 зон\n"
+        "  <code>/fullstats BTC</code> — полная сводка\n\n"
+        "💰 <b>Funding & Data:</b>\n"
+        "  <code>/funding BTC</code> — funding rate (4 биржи)\n"
+        "  <code>/liqhist BTC</code> — история ликвидаций\n"
+        "  <code>/liqstats</code> — ликвидации WebSocket\n"
+        "  <code>/dominance</code> — BTC доминация\n\n"
+        "🌐 <b>Система:</b>\n"
+        "  <code>/net</code> — диагностика сети\n"
+        "  <code>/proxy</code> — статус прокси\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ <b>Мониторинг:</b>\n{coins}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🟡 Жёлтый бар — топ магнит (★)\n"
-        "🟠 Оранжевый — сильная зона (◆)\n"
-        "🟢 Зелёный — шорты → цена растёт\n"
-        "🔴 Красный — лонги → цена падает\n"
-        "📊 Подпись у бара = % до цены + объём\n"
+        "🟡 Жёлтый ★ — топ магнит\n"
+        "🟠 Оранжевый ◆ — сильная зона\n"
+        "🟢 Зелёный — шорты (рост)\n"
+        "🔴 Красный — лонги (падение)\n"
+        "📊 Данные агрегируются со всех бирж\n"
         "⚡ Автоалерт свыше <b>$500,000</b>",
         parse_mode="HTML")
 
@@ -916,6 +1157,218 @@ async def cmd_liqstats(message: types.Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@dp.message(Command("funding"))
+async def cmd_funding(message: types.Message):
+    """Показать funding rate с агрегацией со всех бирж"""
+    if not _is_allowed_chat(message):
+        return
+    
+    parts = message.text.strip().split()
+    coin = parts[1].upper() if len(parts) > 1 else "BTC"
+    sym = coin.replace("USDT", "") + "USDT"
+    
+    wait = await message.reply(f"⏳ Загружаю funding rate для {coin}...", parse_mode="HTML")
+    
+    try:
+        funding_data = await asyncio.to_thread(get_multi_exchange_funding, sym)
+        
+        lines = [f"💰 <b>Funding Rate — {sym}</b>\n"]
+        
+        # Show individual sources
+        sources = ["binance", "bybit", "okx", "bitget"]
+        for src in sources:
+            if src in funding_data and funding_data[src] is not None:
+                val = funding_data[src]
+                emoji = "🟢" if val > 0 else "🔴"
+                lines.append(f"  <code>{src:8}</code>: {emoji} {val:+.4f}%")
+        
+        # Show aggregated value
+        if funding_data.get("aggregated") is not None:
+            agg = funding_data["aggregated"]
+            method = funding_data.get("method", "unknown")
+            sources_count = funding_data.get("sources", 0)
+            emoji = "🟢" if agg > 0 else "🔴"
+            lines.append(f"\n<b>Агрегированное:</b> {emoji} {agg:+.4f}%")
+            lines.append(f"<i>Метод: {method} из {sources_count} источников</i>")
+            
+            # Interpretation
+            if abs(agg) > 0.1:
+                lines.append(f"\n⚠️ Высокий funding! {'Лонги платят шортам' if agg > 0 else 'Шорты платят лонгам'}")
+        else:
+            lines.append("\n❌ Нет данных с бирж")
+        
+        await message.reply("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.exception(e)
+        await message.reply(f"❌ Ошибка: {e}")
+    finally:
+        await wait.delete()
+
+
+@dp.message(Command("liqhist"))
+async def cmd_liqhist(message: types.Message):
+    """Показать исторические ликвидации за 24ч"""
+    if not _is_allowed_chat(message):
+        return
+    
+    parts = message.text.strip().split()
+    coin = parts[1].upper() if len(parts) > 1 else "BTC"
+    sym = coin.replace("USDT", "") + "USDT"
+    
+    wait = await message.reply(f"⏳ Загружаю историю ликвидаций для {coin}...", parse_mode="HTML")
+    
+    try:
+        lines = [f"📊 <b>Исторические ликвидации 24ч — {sym}</b>\n"]
+        
+        # Try Coinglass first
+        coinglass_data = await asyncio.to_thread(get_coinglass_liquidations, sym, 24)
+        if coinglass_data:
+            lines.append(f"<b>Coinglass:</b>")
+            lines.append(f"  🔴 Лонги: ${coinglass_data['long_liq']:,.0f}")
+            lines.append(f"  🟢 Шорты: ${coinglass_data['short_liq']:,.0f}")
+            total = coinglass_data['long_liq'] + coinglass_data['short_liq']
+            lines.append(f"  <b>Всего: ${total:,.0f}</b> ({coinglass_data['entries']} записей)")
+        
+        # Try OKX
+        okx_data = await asyncio.to_thread(get_okx_liquidation_history, sym, 24)
+        if okx_data:
+            lines.append(f"\n<b>OKX:</b>")
+            lines.append(f"  🔴 Лонги: ${okx_data['long_liq']:,.0f}")
+            lines.append(f"  🟢 Шорты: ${okx_data['short_liq']:,.0f}")
+            total = okx_data['long_liq'] + okx_data['short_liq']
+            lines.append(f"  <b>Всего: ${total:,.0f}</b> ({okx_data['entries']} записей)")
+        
+        # WebSocket data
+        ws_totals = _liq_ws_data["total_1h"].get(sym, {"long": 0, "short": 0})
+        if ws_totals["long"] > 0 or ws_totals["short"] > 0:
+            lines.append(f"\n<b>WebSocket (реальное время):</b>")
+            lines.append(f"  🔴 Лонги: ${ws_totals['long']:,.0f}")
+            lines.append(f"  🟢 Шорты: ${ws_totals['short']:,.0f}")
+        
+        if len(lines) == 1:
+            lines.append("❌ Нет данных с источников")
+        
+        await message.reply("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.exception(e)
+        await message.reply(f"❌ Ошибка: {e}")
+    finally:
+        await wait.delete()
+
+
+@dp.message(Command("dominance"))
+async def cmd_dominance(message: types.Message):
+    """Показать BTC доминацию и общую капитализацию"""
+    if not _is_allowed_chat(message):
+        return
+    
+    wait = await message.reply("⏳ Загружаю данные рынка...", parse_mode="HTML")
+    
+    try:
+        data = await asyncio.to_thread(get_btc_dominance)
+        
+        if data:
+            dom = data["btc_dominance"]
+            cap = data["total_market_cap_usd"]
+            change = data["market_cap_change_24h"]
+            
+            emoji = "🟢" if change >= 0 else "🔴"
+            dom_emoji = "👑" if dom > 50 else "⚡"
+            
+            lines = [
+                f"{dom_emoji} <b>BTC Доминация: {dom:.1f}%</b>",
+                f"",
+                f"💰 Общая капитализация: <b>${cap/1e12:.2f}T</b>",
+                f"📊 Изменение 24ч: {emoji} {change:+.2f}%",
+                f"",
+                f"<i>Данные: CoinGecko</i>"
+            ]
+            
+            # Add interpretation
+            if dom > 60:
+                lines.append(f"\n⚠️ Высокая доминация — альтсезон отложен")
+            elif dom < 40:
+                lines.append(f"\n🚀 Низкая доминация — альтсезон активен!")
+            
+            await message.reply("\n".join(lines), parse_mode="HTML")
+        else:
+            await message.reply("❌ Не удалось получить данные с CoinGecko")
+    except Exception as e:
+        logger.exception(e)
+        await message.reply(f"❌ Ошибка: {e}")
+    finally:
+        await wait.delete()
+
+
+@dp.message(Command("fullstats"))
+async def cmd_fullstats(message: types.Message):
+    """Полная сводка по монете: цена, OI, funding, ликвидации"""
+    if not _is_allowed_chat(message):
+        return
+    
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.reply("⚠️ Пример: <code>/fullstats BTC</code>", parse_mode="HTML")
+        return
+    
+    coin = parts[1].upper()
+    sym = coin.replace("USDT", "") + "USDT"
+    
+    wait = await message.reply(f"⏳ Собираю полную сводку для {coin}...", parse_mode="HTML")
+    
+    try:
+        # Get all data in parallel
+        price_task = asyncio.to_thread(get_price, sym)
+        oi_task = asyncio.to_thread(get_multi_exchange_oi, sym, 0)  # Price will be updated
+        funding_task = asyncio.to_thread(get_multi_exchange_funding, sym)
+        
+        price = await price_task
+        oi_data = await asyncio.to_thread(get_multi_exchange_oi, sym, price)
+        funding_data = await funding_task
+        
+        lines = [f"📊 <b>Полная сводка — {sym}</b>\n"]
+        
+        # Price
+        dec = _dec(price)
+        lines.append(f"💰 <b>Цена:</b> ${price:,.{dec}f}")
+        
+        # OI
+        oi_total = oi_data.get("total", 0)
+        oi_sources = oi_data.get("sources", 0)
+        lines.append(f"📈 <b>Open Interest:</b> ${oi_total:,.0f} ({oi_sources} источников)")
+        
+        # Funding
+        if funding_data.get("aggreguated") is not None:
+            fund = funding_data["aggregated"]
+            fund_emoji = "🟢" if fund > 0 else "🔴"
+            lines.append(f"💸 <b>Funding Rate:</b> {fund_emoji} {fund:+.4f}%")
+        
+        # Liquidation zones from build_df
+        try:
+            df, _, _ = build_df(coin)
+            short_max = df[df["type"] == "short"]["usd_value"].max()
+            long_max = df[df["type"] == "long"]["usd_value"].max()
+            lines.append(f"\n🎯 <b>Макс. зона ликвидации:</b>")
+            lines.append(f"   🟢 Шорты: ${short_max:,.0f}")
+            lines.append(f"   🔴 Лонги: ${long_max:,.0f}")
+        except:
+            pass
+        
+        # WebSocket liquidations
+        ws_totals = _liq_ws_data["total_1h"].get(sym, {"long": 0, "short": 0})
+        if ws_totals["long"] > 0 or ws_totals["short"] > 0:
+            lines.append(f"\n⚡ <b>Ликвидации 1ч (WS):</b>")
+            lines.append(f"   🔴 Лонги: ${ws_totals['long']:,.0f}")
+            lines.append(f"   🟢 Шорты: ${ws_totals['short']:,.0f}")
+        
+        await message.reply("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.exception(e)
+        await message.reply(f"❌ Ошибка: {e}")
+    finally:
+        await wait.delete()
+
+
 @dp.message()
 async def cmd_fallback(message: types.Message):
     if message.chat.type in ("group", "supergroup"):
@@ -926,6 +1379,10 @@ async def cmd_fallback(message: types.Message):
         "🔍 <code>/scan</code> — топ магниты по всем монетам\n"
         "🏆 <code>/top</code> — самые жирные зоны сейчас\n"
         "📈 <code>/liqstats</code> — реальные ликвидации\n"
+        "💰 <code>/funding BTC</code> — funding rate (мульти-биржа)\n"
+        "📊 <code>/liqhist BTC</code> — история ликвидаций\n"
+        "👑 <code>/dominance</code> — BTC доминация\n"
+        "📋 <code>/fullstats BTC</code> — полная сводка\n"
         "❓ <code>/help</code> — справка",
         parse_mode="HTML",
     )
