@@ -490,6 +490,32 @@ def get_btc_dominance() -> dict:
     return None
 
 
+def direct_get(base_url: str, path: str, params=None) -> dict:
+    """Direct HTTP GET without any proxies - for emergency fallback"""
+    url = f"{base_url}{path}"
+    try:
+        r = http.get(url, params=params, proxies=None, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        if not r.text:
+            raise ValueError("empty response")
+        return r.json()
+    except Exception as e:
+        logger.debug(f"Direct request failed for {url}: {e}")
+    return None
+
+
+def get_price_direct(sym: str) -> float:
+    """Emergency price fetch without proxies - Bybit only"""
+    try:
+        data = direct_get(BYBIT_BASE_URL, "/v5/market/tickers", 
+                         {"category": "linear", "symbol": sym})
+        if data and data.get("result") and data["result"].get("list"):
+            return float(data["result"]["list"][0]["lastPrice"])
+    except Exception as e:
+        logger.debug(f"Direct price error for {sym}: {e}")
+    return None
+
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -705,6 +731,7 @@ def exchange_get(source: str, base_url: str, path: str, params=None, include_pub
 
 
 def get_price(sym: str) -> float:
+    # Try with proxies first
     data = exchange_get("Binance", BINANCE_BASE_URL, "/fapi/v1/ticker/price", {"symbol": sym})
     if data and "price" in data:
         return float(data["price"])
@@ -717,6 +744,13 @@ def get_price(sym: str) -> float:
     )
     if data and data.get("result") and data["result"].get("list"):
         return float(data["result"]["list"][0]["lastPrice"])
+    
+    # Emergency fallback - direct connection without proxies
+    logger.warning(f"All proxy attempts failed for {sym}, trying direct connection...")
+    price = get_price_direct(sym)
+    if price:
+        logger.info(f"Got price for {sym} via direct connection: ${price:,.2f}")
+        return price
 
     raise RuntimeError(f"No market price source is reachable for {sym}")
 
